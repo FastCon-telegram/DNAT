@@ -1,13 +1,12 @@
 #!/bin/bash
 
 #===============================================================================
-# NAT Bridge Manager v2.1
-# - Исправлены зависания и ошибки
+# NAT Bridge Manager v2.2
+# - Исправлены дубликаты правил (проверка перед добавлением)
 # - Именованные правила с поддержкой вкл/выкл  
 # - Отображение протокола TCP/UDP
 #===============================================================================
 
-# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -16,14 +15,13 @@ CYAN='\033[0;36m'
 GRAY='\033[0;90m'
 NC='\033[0m'
 
-# Конфиг
 RULES_DIR="/etc/nat-bridge"
 RULES_FILE="$RULES_DIR/rules.conf"
 
 print_header() {
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}          ${GREEN}🌐 NAT Bridge Manager v2.1${NC}                        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}          ${GREEN}🌐 NAT Bridge Manager v2.2${NC}                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}          ${YELLOW}Управление DNAT правилами${NC}                         ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -63,11 +61,24 @@ ensure_masquerade() {
     iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -j MASQUERADE 2>/dev/null || true
 }
 
+# Добавить правило с проверкой на дубликат
 add_iptables_rule() {
     local sp="$1" di="$2" dp="$3" pr="$4"
     [[ -z "$sp" || -z "$di" || -z "$dp" ]] && return
-    [[ "$pr" == "both" || "$pr" == "tcp" ]] && iptables -t nat -A PREROUTING -p tcp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null || true
-    [[ "$pr" == "both" || "$pr" == "udp" ]] && iptables -t nat -A PREROUTING -p udp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null || true
+    
+    # TCP: проверяем существование, если нет - добавляем
+    if [[ "$pr" == "both" || "$pr" == "tcp" ]]; then
+        if ! iptables -t nat -C PREROUTING -p tcp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null; then
+            iptables -t nat -A PREROUTING -p tcp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null || true
+        fi
+    fi
+    
+    # UDP: проверяем существование, если нет - добавляем
+    if [[ "$pr" == "both" || "$pr" == "udp" ]]; then
+        if ! iptables -t nat -C PREROUTING -p udp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null; then
+            iptables -t nat -A PREROUTING -p udp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null || true
+        fi
+    fi
 }
 
 remove_iptables_rule() {
@@ -353,6 +364,23 @@ show_status() {
     echo ""; read -rp "Нажмите Enter..."
 }
 
+# Очистка дубликатов в iptables
+cleanup_duplicates() {
+    [[ ! -f "$RULES_FILE" ]] && return
+    
+    # Сначала удаляем все DNAT правила
+    iptables -t nat -F PREROUTING 2>/dev/null || true
+    
+    # Затем добавляем только нужные (из конфига)
+    while IFS='|' read -r name sp di dp pr en; do
+        [[ -z "$name" || "$name" == \#* || -z "$sp" ]] && continue
+        [[ "$en" == "1" ]] && add_iptables_rule "$sp" "$di" "$dp" "$pr"
+    done < "$RULES_FILE"
+    
+    ensure_masquerade
+    save_iptables
+}
+
 main_menu() {
     while true; do
         print_header
@@ -366,6 +394,7 @@ main_menu() {
         echo "  5) ✏️  Переименовать"
         echo "  6) 🗑️  Удалить правило"
         echo "  7) 📊 Статус"
+        echo "  8) 🧹 Очистить дубликаты"
         echo "  0) 🚪 Выход"
         echo ""
         
@@ -374,6 +403,7 @@ main_menu() {
         case "$ch" in
             1) show_rules;; 2) add_rule;; 3) quick_add;; 4) toggle_rule;;
             5) rename_rule;; 6) delete_rule;; 7) show_status;;
+            8) cleanup_duplicates; print_success "Дубликаты очищены"; sleep 2;;
             0) print_success "До свидания!"; exit 0;;
             *) print_error "Неверный выбор"; sleep 1;;
         esac
