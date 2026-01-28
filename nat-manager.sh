@@ -1,12 +1,11 @@
 #!/bin/bash
 
 #===============================================================================
-# NAT Bridge Manager v2.0
-# - Именованные правила с поддержкой вкл/выкл
+# NAT Bridge Manager v2.1
+# - Исправлены зависания и ошибки
+# - Именованные правила с поддержкой вкл/выкл  
 # - Отображение протокола TCP/UDP
 #===============================================================================
-
-set -e
 
 # Цвета
 RED='\033[0;31m'
@@ -21,13 +20,10 @@ NC='\033[0m'
 RULES_DIR="/etc/nat-bridge"
 RULES_FILE="$RULES_DIR/rules.conf"
 
-#-------------------------------------------------------------------------------
-# Функции вывода
-#-------------------------------------------------------------------------------
 print_header() {
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}          ${GREEN}🌐 NAT Bridge Manager v2.0${NC}                        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}          ${GREEN}🌐 NAT Bridge Manager v2.1${NC}                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}          ${YELLOW}Управление DNAT правилами${NC}                         ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -36,11 +32,7 @@ print_header() {
 print_success() { echo -e "${GREEN}✓ $1${NC}"; }
 print_error() { echo -e "${RED}✗ $1${NC}"; }
 print_warning() { echo -e "${YELLOW}⚠ $1${NC}"; }
-print_info() { echo -e "${BLUE}ℹ $1${NC}"; }
 
-#-------------------------------------------------------------------------------
-# Проверка root
-#-------------------------------------------------------------------------------
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "Запустите от root: sudo $0"
@@ -48,558 +40,325 @@ check_root() {
     fi
 }
 
-#-------------------------------------------------------------------------------
-# Начальная настройка
-#-------------------------------------------------------------------------------
 initial_setup() {
-    mkdir -p "$RULES_DIR"
-    touch "$RULES_FILE"
-
-    # Включаем IP forwarding
-    if [[ $(cat /proc/sys/net/ipv4/ip_forward) != "1" ]]; then
-        echo 1 > /proc/sys/net/ipv4/ip_forward
-    fi
-
-    # Делаем постоянным
-    if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-        sysctl -p > /dev/null 2>&1
-    fi
-
-    # Устанавливаем iptables-persistent
+    mkdir -p "$RULES_DIR" 2>/dev/null || true
+    touch "$RULES_FILE" 2>/dev/null || true
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+    grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf 2>/dev/null
+    sysctl -p > /dev/null 2>&1 || true
+    
     if ! command -v netfilter-persistent &> /dev/null; then
-        print_warning "Устанавливаю iptables-persistent..."
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent > /dev/null 2>&1
-        print_success "iptables-persistent установлен"
+        apt-get update -qq 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent > /dev/null 2>&1 || true
     fi
 }
 
-#-------------------------------------------------------------------------------
-# Сохранение правил iptables
-#-------------------------------------------------------------------------------
 save_iptables() {
-    mkdir -p /etc/iptables
+    mkdir -p /etc/iptables 2>/dev/null || true
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     netfilter-persistent save > /dev/null 2>&1 || true
 }
 
-#-------------------------------------------------------------------------------
-# Добавление MASQUERADE
-#-------------------------------------------------------------------------------
 ensure_masquerade() {
-    if ! iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -j MASQUERADE
-    fi
+    iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -j MASQUERADE 2>/dev/null || true
 }
 
-#-------------------------------------------------------------------------------
-# Добавить правило iptables
-#-------------------------------------------------------------------------------
 add_iptables_rule() {
-    local src_port=$1
-    local dest_ip=$2
-    local dest_port=$3
-    local proto=$4  # tcp, udp, both
-
-    if [[ "$proto" == "both" || "$proto" == "tcp" ]]; then
-        iptables -t nat -A PREROUTING -p tcp --dport "$src_port" -j DNAT --to-destination "$dest_ip:$dest_port" 2>/dev/null || true
-    fi
-    if [[ "$proto" == "both" || "$proto" == "udp" ]]; then
-        iptables -t nat -A PREROUTING -p udp --dport "$src_port" -j DNAT --to-destination "$dest_ip:$dest_port" 2>/dev/null || true
-    fi
+    local sp="$1" di="$2" dp="$3" pr="$4"
+    [[ -z "$sp" || -z "$di" || -z "$dp" ]] && return
+    [[ "$pr" == "both" || "$pr" == "tcp" ]] && iptables -t nat -A PREROUTING -p tcp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null || true
+    [[ "$pr" == "both" || "$pr" == "udp" ]] && iptables -t nat -A PREROUTING -p udp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null || true
 }
 
-#-------------------------------------------------------------------------------
-# Удалить правило iptables
-#-------------------------------------------------------------------------------
 remove_iptables_rule() {
-    local src_port=$1
-    local dest_ip=$2
-    local dest_port=$3
-    local proto=$4
-
-    if [[ "$proto" == "both" || "$proto" == "tcp" ]]; then
-        iptables -t nat -D PREROUTING -p tcp --dport "$src_port" -j DNAT --to-destination "$dest_ip:$dest_port" 2>/dev/null || true
-    fi
-    if [[ "$proto" == "both" || "$proto" == "udp" ]]; then
-        iptables -t nat -D PREROUTING -p udp --dport "$src_port" -j DNAT --to-destination "$dest_ip:$dest_port" 2>/dev/null || true
-    fi
+    local sp="$1" di="$2" dp="$3" pr="$4"
+    [[ -z "$sp" || -z "$di" || -z "$dp" ]] && return
+    [[ "$pr" == "both" || "$pr" == "tcp" ]] && iptables -t nat -D PREROUTING -p tcp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null || true
+    [[ "$pr" == "both" || "$pr" == "udp" ]] && iptables -t nat -D PREROUTING -p udp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null || true
 }
 
-#-------------------------------------------------------------------------------
-# Загрузить правила из конфига и применить включенные
-#-------------------------------------------------------------------------------
 apply_rules() {
-    while IFS='|' read -r name src_port dest_ip dest_port proto enabled || [[ -n "$name" ]]; do
-        [[ -z "$name" || "$name" == \#* ]] && continue
-        
-        if [[ "$enabled" == "1" ]]; then
-            add_iptables_rule "$src_port" "$dest_ip" "$dest_port" "$proto"
-        fi
+    [[ ! -f "$RULES_FILE" ]] && return
+    while IFS='|' read -r name sp di dp pr en; do
+        [[ -z "$name" || "$name" == \#* || -z "$sp" ]] && continue
+        [[ "$en" == "1" ]] && add_iptables_rule "$sp" "$di" "$dp" "$pr"
     done < "$RULES_FILE"
-    
     ensure_masquerade
     save_iptables
 }
 
-#-------------------------------------------------------------------------------
-# Показать все правила
-#-------------------------------------------------------------------------------
+get_rules_count() {
+    local t=0 e=0
+    [[ -f "$RULES_FILE" ]] && while IFS='|' read -r n sp di dp pr en; do
+        [[ -z "$n" || "$n" == \#* || -z "$sp" ]] && continue
+        t=$((t+1)); [[ "$en" == "1" ]] && e=$((e+1))
+    done < "$RULES_FILE"
+    echo "$t $e"
+}
+
 show_rules() {
     print_header
     echo -e "${GREEN}📋 Список DNAT правил${NC}"
     echo "═══════════════════════════════════════════════════════════════════════"
     echo ""
-
+    
     if [[ ! -s "$RULES_FILE" ]]; then
         print_warning "Нет настроенных правил"
-        echo ""
-        read -p "Нажмите Enter..."
-        return
+        echo ""; read -rp "Нажмите Enter..."; return
     fi
-
+    
     echo -e "${YELLOW}#   Статус   Название              Порт       Назначение           Прото${NC}"
     echo "───────────────────────────────────────────────────────────────────────"
-
+    
     local i=1
-    while IFS='|' read -r name src_port dest_ip dest_port proto enabled || [[ -n "$name" ]]; do
-        [[ -z "$name" || "$name" == \#* ]] && continue
-
-        if [[ "$enabled" == "1" ]]; then
-            status="${GREEN}● ВКЛ${NC}"
-        else
-            status="${GRAY}○ ВЫКЛ${NC}"
-        fi
-
-        # Отображение протокола
-        case "$proto" in
-            both) proto_disp="TCP+UDP" ;;
-            tcp)  proto_disp="TCP" ;;
-            udp)  proto_disp="UDP" ;;
-            *)    proto_disp="$proto" ;;
-        esac
-
-        printf "%-3s  [%b]  %-20s  %-9s  %-19s  %s\n" "$i" "$status" "$name" ":$src_port" "$dest_ip:$dest_port" "$proto_disp"
-        ((i++))
+    while IFS='|' read -r n sp di dp pr en; do
+        [[ -z "$n" || "$n" == \#* || -z "$sp" ]] && continue
+        [[ "$en" == "1" ]] && st="${GREEN}● ВКЛ${NC}" || st="${GRAY}○ ВЫКЛ${NC}"
+        case "$pr" in both) pd="TCP+UDP";; tcp) pd="TCP";; udp) pd="UDP";; *) pd="TCP+UDP";; esac
+        printf "%-3s  [%b]  %-20s  %-9s  %-19s  %s\n" "$i" "$st" "$n" ":$sp" "$di:$dp" "$pd"
+        i=$((i+1))
     done < "$RULES_FILE"
-
+    
     echo ""
     echo "═══════════════════════════════════════════════════════════════════════"
-    
-    # Статус MASQUERADE
-    if iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "MASQUERADE"; then
-        print_success "MASQUERADE: активен"
-    else
-        print_warning "MASQUERADE: не настроен"
-    fi
-
-    echo ""
-    read -p "Нажмите Enter..."
+    iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "MASQUERADE" && print_success "MASQUERADE: активен" || print_warning "MASQUERADE: не настроен"
+    echo ""; read -rp "Нажмите Enter..."
 }
 
-#-------------------------------------------------------------------------------
-# Добавить новое правило
-#-------------------------------------------------------------------------------
 add_rule() {
     print_header
     echo -e "${GREEN}➕ Добавление нового правила${NC}"
     echo "───────────────────────────────────────────────────────────────"
     echo ""
-
-    # Название правила
-    read -p "Название правила (напр. aeza-spb): " rule_name
-    if [[ -z "$rule_name" ]]; then
-        print_error "Название обязательно"
-        sleep 2
-        return
-    fi
     
-    # Убираем спецсимволы
-    rule_name=$(echo "$rule_name" | tr -d '|')
-
-    # Проверка дубликата
-    if grep -q "^$rule_name|" "$RULES_FILE" 2>/dev/null; then
-        print_error "Правило '$rule_name' уже существует"
-        sleep 2
-        return
-    fi
-
-    # Входящий порт
+    local rn="" sp="" di="" dp="" pc="" pr="" cf=""
+    
+    read -rp "Название правила (напр. aeza-spb): " rn
+    [[ -z "$rn" ]] && { print_error "Название обязательно"; sleep 2; return; }
+    rn="${rn//|/}"
+    grep -q "^${rn}|" "$RULES_FILE" 2>/dev/null && { print_error "Правило '$rn' уже существует"; sleep 2; return; }
+    
     while true; do
-        read -p "Входящий порт: " src_port
-        [[ "$src_port" =~ ^[0-9]+$ ]] && [ "$src_port" -ge 1 ] && [ "$src_port" -le 65535 ] && break
+        read -rp "Входящий порт: " sp
+        [[ "$sp" =~ ^[0-9]+$ ]] && [[ "$sp" -ge 1 ]] && [[ "$sp" -le 65535 ]] && break
         print_error "Порт 1-65535"
     done
-
-    # IP назначения
+    
     while true; do
-        read -p "IP назначения: " dest_ip
-        [[ "$dest_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+        read -rp "IP назначения: " di
+        [[ "$di" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
         print_error "Неверный IP"
     done
-
-    # Порт назначения
-    read -p "Порт назначения [443]: " dest_port
-    dest_port=${dest_port:-443}
-
-    # Протокол
-    echo ""
-    echo "Протокол: 1) TCP+UDP  2) Только TCP  3) Только UDP"
-    read -p "Выбор [1]: " proto_choice
-    proto_choice=${proto_choice:-1}
     
-    case $proto_choice in
-        1) proto="both" ;;
-        2) proto="tcp" ;;
-        3) proto="udp" ;;
-        *) proto="both" ;;
-    esac
-
-    echo ""
-    echo -e "Создать: ${CYAN}$rule_name${NC} — :$src_port → $dest_ip:$dest_port ($proto)"
-    read -p "Подтвердить? (y/n): " confirm
-    [[ "$confirm" != "y" ]] && return
-
-    # Сохраняем в конфиг
-    echo "$rule_name|$src_port|$dest_ip|$dest_port|$proto|1" >> "$RULES_FILE"
-
-    # Применяем правило
-    add_iptables_rule "$src_port" "$dest_ip" "$dest_port" "$proto"
+    read -rp "Порт назначения [443]: " dp; dp="${dp:-443}"
+    
+    echo ""; echo "Протокол: 1) TCP+UDP  2) TCP  3) UDP"
+    read -rp "Выбор [1]: " pc; pc="${pc:-1}"
+    case "$pc" in 2) pr="tcp";; 3) pr="udp";; *) pr="both";; esac
+    
+    echo ""; echo -e "Создать: ${CYAN}$rn${NC} — :$sp → $di:$dp ($pr)"
+    read -rp "Подтвердить? (y/n): " cf
+    [[ "$cf" != "y" && "$cf" != "Y" ]] && return
+    
+    echo "${rn}|${sp}|${di}|${dp}|${pr}|1" >> "$RULES_FILE"
+    add_iptables_rule "$sp" "$di" "$dp" "$pr"
     ensure_masquerade
     save_iptables
-
-    print_success "Правило '$rule_name' добавлено и включено"
-    read -p "Нажмите Enter..."
+    
+    print_success "Правило '$rn' добавлено и включено"
+    sleep 2
 }
 
-#-------------------------------------------------------------------------------
-# Переключить правило (вкл/выкл)
-#-------------------------------------------------------------------------------
+quick_add() {
+    print_header
+    echo -e "${GREEN}⚡ Быстрое добавление${NC}"
+    echo "───────────────────────────────────────────────────────────────"
+    echo ""; echo "Формат: НАЗВАНИЕ ПОРТ IP [ПОРТ_НАЗН]"
+    echo "Пример: aeza-spb 44333 116.202.1.1 443"; echo ""
+    
+    local inp="" rn="" sp="" di="" dp=""
+    read -rp "Ввод: " inp
+    read -r rn sp di dp <<< "$inp"
+    dp="${dp:-443}"
+    
+    [[ -z "$rn" || -z "$sp" || -z "$di" ]] && { print_error "Неверный формат"; sleep 2; return; }
+    rn="${rn//|/}"
+    grep -q "^${rn}|" "$RULES_FILE" 2>/dev/null && { print_error "Правило '$rn' уже существует"; sleep 2; return; }
+    
+    echo "${rn}|${sp}|${di}|${dp}|both|1" >> "$RULES_FILE"
+    add_iptables_rule "$sp" "$di" "$dp" "both"
+    ensure_masquerade
+    save_iptables
+    
+    print_success "$rn: :$sp → $di:$dp"
+    sleep 2
+}
+
 toggle_rule() {
     print_header
     echo -e "${BLUE}🔄 Включить/Выключить правило${NC}"
     echo "───────────────────────────────────────────────────────────────"
     echo ""
-
-    if [[ ! -s "$RULES_FILE" ]]; then
-        print_warning "Нет правил"
-        sleep 2
-        return
-    fi
-
+    
+    [[ ! -s "$RULES_FILE" ]] && { print_warning "Нет правил"; sleep 2; return; }
+    
     echo -e "${YELLOW}#   Статус   Название              Порт       Назначение${NC}"
     echo "───────────────────────────────────────────────────────────────"
-
-    local i=1
-    while IFS='|' read -r name src_port dest_ip dest_port proto enabled || [[ -n "$name" ]]; do
-        [[ -z "$name" || "$name" == \#* ]] && continue
-
-        if [[ "$enabled" == "1" ]]; then
-            status="${GREEN}● ВКЛ${NC}"
-        else
-            status="${GRAY}○ ВЫКЛ${NC}"
-        fi
-
-        printf "%-3s  [%b]  %-20s  %-9s  %s:%s\n" "$i" "$status" "$name" ":$src_port" "$dest_ip" "$dest_port"
-        ((i++))
-    done < "$RULES_FILE"
-
-    echo ""
-    read -p "Номер правила для переключения (q - отмена): " num
-    [[ "$num" == "q" ]] && return
-
-    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
-        print_error "Неверный номер"
-        sleep 2
-        return
-    fi
-
-    # Получаем правило по номеру
-    local line_num=0
-    local target_name=""
-    local t_src_port="" t_dest_ip="" t_dest_port="" t_proto="" t_enabled=""
     
-    while IFS='|' read -r name src_port dest_ip dest_port proto enabled || [[ -n "$name" ]]; do
-        [[ -z "$name" || "$name" == \#* ]] && continue
-        ((line_num++))
-        if [[ $line_num -eq $num ]]; then
-            target_name="$name"
-            t_src_port="$src_port"
-            t_dest_ip="$dest_ip"
-            t_dest_port="$dest_port"
-            t_proto="$proto"
-            t_enabled="$enabled"
-            break
-        fi
+    local i=1
+    while IFS='|' read -r n sp di dp pr en; do
+        [[ -z "$n" || "$n" == \#* || -z "$sp" ]] && continue
+        [[ "$en" == "1" ]] && st="${GREEN}● ВКЛ${NC}" || st="${GRAY}○ ВЫКЛ${NC}"
+        printf "%-3s  [%b]  %-20s  %-9s  %s:%s\n" "$i" "$st" "$n" ":$sp" "$di" "$dp"
+        i=$((i+1))
     done < "$RULES_FILE"
-
-    if [[ -z "$target_name" ]]; then
-        print_error "Правило не найдено"
-        sleep 2
-        return
-    fi
-
-    # Переключаем
-    if [[ "$t_enabled" == "1" ]]; then
-        # Выключаем
-        new_enabled="0"
-        remove_iptables_rule "$t_src_port" "$t_dest_ip" "$t_dest_port" "$t_proto"
-        print_success "Правило '$target_name' ВЫКЛЮЧЕНО"
+    
+    echo ""
+    local num=""
+    read -rp "Номер правила (q - отмена): " num
+    [[ "$num" == "q" || "$num" == "Q" || -z "$num" ]] && return
+    [[ ! "$num" =~ ^[0-9]+$ ]] && { print_error "Неверный номер"; sleep 2; return; }
+    
+    local ln=0 tn="" tsp="" tdi="" tdp="" tpr="" ten=""
+    while IFS='|' read -r n sp di dp pr en; do
+        [[ -z "$n" || "$n" == \#* || -z "$sp" ]] && continue
+        ln=$((ln+1))
+        [[ $ln -eq $num ]] && { tn="$n"; tsp="$sp"; tdi="$di"; tdp="$dp"; tpr="$pr"; ten="$en"; break; }
+    done < "$RULES_FILE"
+    
+    [[ -z "$tn" ]] && { print_error "Правило не найдено"; sleep 2; return; }
+    
+    local ne=""
+    if [[ "$ten" == "1" ]]; then
+        ne="0"; remove_iptables_rule "$tsp" "$tdi" "$tdp" "$tpr"
+        print_success "Правило '$tn' ВЫКЛЮЧЕНО"
     else
-        # Включаем
-        new_enabled="1"
-        add_iptables_rule "$t_src_port" "$t_dest_ip" "$t_dest_port" "$t_proto"
-        ensure_masquerade
-        print_success "Правило '$target_name' ВКЛЮЧЕНО"
+        ne="1"; add_iptables_rule "$tsp" "$tdi" "$tdp" "$tpr"; ensure_masquerade
+        print_success "Правило '$tn' ВКЛЮЧЕНО"
     fi
-
-    # Обновляем конфиг
-    local tmp_file=$(mktemp)
-    while IFS='|' read -r n sp di dp pr en || [[ -n "$n" ]]; do
+    
+    local tf; tf=$(mktemp)
+    while IFS='|' read -r n sp di dp pr en; do
         [[ -z "$n" ]] && continue
-        if [[ "$n" == "$target_name" ]]; then
-            echo "$target_name|$t_src_port|$t_dest_ip|$t_dest_port|$t_proto|$new_enabled" >> "$tmp_file"
-        else
-            echo "$n|$sp|$di|$dp|$pr|$en" >> "$tmp_file"
-        fi
+        [[ "$n" == "$tn" ]] && echo "${tn}|${tsp}|${tdi}|${tdp}|${tpr}|${ne}" >> "$tf" || echo "${n}|${sp}|${di}|${dp}|${pr}|${en}" >> "$tf"
     done < "$RULES_FILE"
-    mv "$tmp_file" "$RULES_FILE"
-
+    mv "$tf" "$RULES_FILE"
+    
     save_iptables
-    read -p "Нажмите Enter..."
+    sleep 2
 }
 
-#-------------------------------------------------------------------------------
-# Удалить правило
-#-------------------------------------------------------------------------------
 delete_rule() {
     print_header
     echo -e "${RED}🗑️  Удаление правила${NC}"
     echo "───────────────────────────────────────────────────────────────"
     echo ""
-
-    if [[ ! -s "$RULES_FILE" ]]; then
-        print_warning "Нет правил"
-        sleep 2
-        return
-    fi
-
+    
+    [[ ! -s "$RULES_FILE" ]] && { print_warning "Нет правил"; sleep 2; return; }
+    
     echo -e "${YELLOW}#   Статус   Название              Порт       Назначение${NC}"
     echo "───────────────────────────────────────────────────────────────"
-
-    local i=1
-    while IFS='|' read -r name src_port dest_ip dest_port proto enabled || [[ -n "$name" ]]; do
-        [[ -z "$name" || "$name" == \#* ]] && continue
-
-        if [[ "$enabled" == "1" ]]; then
-            status="${GREEN}● ВКЛ${NC}"
-        else
-            status="${GRAY}○ ВЫКЛ${NC}"
-        fi
-
-        printf "%-3s  [%b]  %-20s  %-9s  %s:%s\n" "$i" "$status" "$name" ":$src_port" "$dest_ip" "$dest_port"
-        ((i++))
-    done < "$RULES_FILE"
-
-    echo ""
-    read -p "Номер правила для УДАЛЕНИЯ (q - отмена): " num
-    [[ "$num" == "q" ]] && return
-
-    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
-        print_error "Неверный номер"
-        sleep 2
-        return
-    fi
-
-    # Получаем правило по номеру
-    local line_num=0
-    local target_name=""
-    local t_src_port="" t_dest_ip="" t_dest_port="" t_proto="" t_enabled=""
     
-    while IFS='|' read -r name src_port dest_ip dest_port proto enabled || [[ -n "$name" ]]; do
-        [[ -z "$name" || "$name" == \#* ]] && continue
-        ((line_num++))
-        if [[ $line_num -eq $num ]]; then
-            target_name="$name"
-            t_src_port="$src_port"
-            t_dest_ip="$dest_ip"
-            t_dest_port="$dest_port"
-            t_proto="$proto"
-            t_enabled="$enabled"
-            break
-        fi
+    local i=1
+    while IFS='|' read -r n sp di dp pr en; do
+        [[ -z "$n" || "$n" == \#* || -z "$sp" ]] && continue
+        [[ "$en" == "1" ]] && st="${GREEN}● ВКЛ${NC}" || st="${GRAY}○ ВЫКЛ${NC}"
+        printf "%-3s  [%b]  %-20s  %-9s  %s:%s\n" "$i" "$st" "$n" ":$sp" "$di" "$dp"
+        i=$((i+1))
     done < "$RULES_FILE"
-
-    if [[ -z "$target_name" ]]; then
-        print_error "Правило не найдено"
-        sleep 2
-        return
-    fi
-
-    read -p "Удалить '$target_name'? (y/n): " confirm
-    [[ "$confirm" != "y" ]] && return
-
-    # Удаляем из iptables если включено
-    if [[ "$t_enabled" == "1" ]]; then
-        remove_iptables_rule "$t_src_port" "$t_dest_ip" "$t_dest_port" "$t_proto"
-    fi
-
-    # Удаляем из конфига
-    grep -v "^$target_name|" "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"
-
-    save_iptables
-    print_success "Правило '$target_name' удалено"
-    read -p "Нажмите Enter..."
-}
-
-#-------------------------------------------------------------------------------
-# Быстрое добавление
-#-------------------------------------------------------------------------------
-quick_add() {
-    print_header
-    echo -e "${GREEN}⚡ Быстрое добавление${NC}"
-    echo "───────────────────────────────────────────────────────────────"
+    
     echo ""
-    echo "Формат: НАЗВАНИЕ ПОРТ IP [ПОРТ_НАЗН]"
-    echo "Пример: aeza-spb 44333 116.202.1.1 443"
-    echo ""
-    read -p "Ввод: " rule_name src_port dest_ip dest_port
-    dest_port=${dest_port:-443}
-
-    if [[ -z "$rule_name" || -z "$src_port" || -z "$dest_ip" ]]; then
-        print_error "Неверный формат"
-        sleep 2
-        return
-    fi
-
-    rule_name=$(echo "$rule_name" | tr -d '|')
-
-    if grep -q "^$rule_name|" "$RULES_FILE" 2>/dev/null; then
-        print_error "Правило '$rule_name' уже существует"
-        sleep 2
-        return
-    fi
-
-    echo "$rule_name|$src_port|$dest_ip|$dest_port|both|1" >> "$RULES_FILE"
-    add_iptables_rule "$src_port" "$dest_ip" "$dest_port" "both"
-    ensure_masquerade
+    local num=""
+    read -rp "Номер для УДАЛЕНИЯ (q - отмена): " num
+    [[ "$num" == "q" || "$num" == "Q" || -z "$num" ]] && return
+    [[ ! "$num" =~ ^[0-9]+$ ]] && { print_error "Неверный номер"; sleep 2; return; }
+    
+    local ln=0 tn="" tsp="" tdi="" tdp="" tpr="" ten=""
+    while IFS='|' read -r n sp di dp pr en; do
+        [[ -z "$n" || "$n" == \#* || -z "$sp" ]] && continue
+        ln=$((ln+1))
+        [[ $ln -eq $num ]] && { tn="$n"; tsp="$sp"; tdi="$di"; tdp="$dp"; tpr="$pr"; ten="$en"; break; }
+    done < "$RULES_FILE"
+    
+    [[ -z "$tn" ]] && { print_error "Правило не найдено"; sleep 2; return; }
+    
+    local cf=""
+    read -rp "Удалить '$tn'? (y/n): " cf
+    [[ "$cf" != "y" && "$cf" != "Y" ]] && return
+    
+    [[ "$ten" == "1" ]] && remove_iptables_rule "$tsp" "$tdi" "$tdp" "$tpr"
+    grep -v "^${tn}|" "$RULES_FILE" > "$RULES_FILE.tmp" 2>/dev/null && mv "$RULES_FILE.tmp" "$RULES_FILE"
+    
     save_iptables
-
-    print_success "$rule_name: :$src_port → $dest_ip:$dest_port"
+    print_success "Правило '$tn' удалено"
     sleep 2
 }
 
-#-------------------------------------------------------------------------------
-# Переименовать правило
-#-------------------------------------------------------------------------------
 rename_rule() {
     print_header
     echo -e "${BLUE}✏️  Переименовать правило${NC}"
     echo "───────────────────────────────────────────────────────────────"
     echo ""
-
-    if [[ ! -s "$RULES_FILE" ]]; then
-        print_warning "Нет правил"
-        sleep 2
-        return
-    fi
-
+    
+    [[ ! -s "$RULES_FILE" ]] && { print_warning "Нет правил"; sleep 2; return; }
+    
     local i=1
-    while IFS='|' read -r name src_port dest_ip dest_port proto enabled || [[ -n "$name" ]]; do
-        [[ -z "$name" || "$name" == \#* ]] && continue
-        echo "$i) $name"
-        ((i++))
+    while IFS='|' read -r n sp di dp pr en; do
+        [[ -z "$n" || "$n" == \#* || -z "$sp" ]] && continue
+        echo "$i) $n"; i=$((i+1))
     done < "$RULES_FILE"
-
+    
     echo ""
-    read -p "Номер правила (q - отмена): " num
-    [[ "$num" == "q" ]] && return
-
-    # Получаем старое имя
-    local line_num=0
-    local old_name=""
-    while IFS='|' read -r name src_port dest_ip dest_port proto enabled || [[ -n "$name" ]]; do
-        [[ -z "$name" || "$name" == \#* ]] && continue
-        ((line_num++))
-        [[ $line_num -eq $num ]] && old_name="$name" && break
+    local num=""
+    read -rp "Номер правила (q - отмена): " num
+    [[ "$num" == "q" || "$num" == "Q" || -z "$num" ]] && return
+    [[ ! "$num" =~ ^[0-9]+$ ]] && { print_error "Неверный номер"; sleep 2; return; }
+    
+    local ln=0 on=""
+    while IFS='|' read -r n sp di dp pr en; do
+        [[ -z "$n" || "$n" == \#* || -z "$sp" ]] && continue
+        ln=$((ln+1)); [[ $ln -eq $num ]] && { on="$n"; break; }
     done < "$RULES_FILE"
-
-    if [[ -z "$old_name" ]]; then
-        print_error "Не найдено"
-        sleep 2
-        return
-    fi
-
-    read -p "Новое название для '$old_name': " new_name
-    new_name=$(echo "$new_name" | tr -d '|')
-
-    if [[ -z "$new_name" ]]; then
-        print_error "Название обязательно"
-        sleep 2
-        return
-    fi
-
-    sed -i "s/^$old_name|/$new_name|/" "$RULES_FILE"
-    print_success "Переименовано: $old_name → $new_name"
-    read -p "Нажмите Enter..."
+    
+    [[ -z "$on" ]] && { print_error "Не найдено"; sleep 2; return; }
+    
+    local nn=""
+    read -rp "Новое название для '$on': " nn
+    nn="${nn//|/}"
+    [[ -z "$nn" ]] && { print_error "Название обязательно"; sleep 2; return; }
+    
+    sed -i "s/^${on}|/${nn}|/" "$RULES_FILE"
+    print_success "Переименовано: $on → $nn"
+    sleep 2
 }
 
-#-------------------------------------------------------------------------------
-# Показать статус
-#-------------------------------------------------------------------------------
 show_status() {
     print_header
     echo -e "${CYAN}📊 Статус системы${NC}"
     echo "───────────────────────────────────────────────────────────────"
     echo ""
-
-    # IP Forward
-    [[ $(cat /proc/sys/net/ipv4/ip_forward) == "1" ]] && print_success "IP Forwarding: ВКЛ" || print_error "IP Forwarding: ВЫКЛ"
-
-    # Количество правил
-    local total=0 enabled=0 disabled=0
-    while IFS='|' read -r name src_port dest_ip dest_port proto en || [[ -n "$name" ]]; do
-        [[ -z "$name" || "$name" == \#* ]] && continue
-        ((total++))
-        [[ "$en" == "1" ]] && ((enabled++)) || ((disabled++))
-    done < "$RULES_FILE"
-
-    echo -e "  Всего правил: ${CYAN}$total${NC} (${GREEN}$enabled ВКЛ${NC} / ${GRAY}$disabled ВЫКЛ${NC})"
-
-    # MASQUERADE
+    
+    [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]] && print_success "IP Forwarding: ВКЛ" || print_error "IP Forwarding: ВЫКЛ"
+    
+    local c; c=$(get_rules_count); local t e; read -r t e <<< "$c"
+    echo -e "  Всего правил: ${CYAN}$t${NC} (${GREEN}$e ВКЛ${NC} / ${GRAY}$((t-e)) ВЫКЛ${NC})"
+    
     iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "MASQUERADE" && print_success "MASQUERADE: ВКЛ" || print_warning "MASQUERADE: ВЫКЛ"
-
-    # persistent
     command -v netfilter-persistent &>/dev/null && print_success "iptables-persistent: OK" || print_warning "iptables-persistent: нет"
-
-    echo ""
-    echo -e "${YELLOW}Активные DNAT правила в iptables:${NC}"
-    iptables -t nat -L PREROUTING -n 2>/dev/null | grep "DNAT" | head -10 || echo "  (нет)"
-
-    echo ""
-    read -p "Нажмите Enter..."
+    
+    echo ""; echo -e "${YELLOW}Активные DNAT правила:${NC}"
+    local dr; dr=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep "DNAT" | head -10)
+    [[ -n "$dr" ]] && echo "$dr" || echo "  (нет)"
+    
+    echo ""; read -rp "Нажмите Enter..."
 }
 
-#-------------------------------------------------------------------------------
-# Главное меню
-#-------------------------------------------------------------------------------
 main_menu() {
     while true; do
         print_header
-
-        # Быстрая статистика
-        local total=0 enabled=0
-        while IFS='|' read -r name src_port dest_ip dest_port proto en || [[ -n "$name" ]]; do
-            [[ -z "$name" || "$name" == \#* ]] && continue
-            ((total++))
-            [[ "$en" == "1" ]] && ((enabled++))
-        done < "$RULES_FILE"
-
-        echo -e "  Правил: ${CYAN}$total${NC} всего, ${GREEN}$enabled${NC} включено"
-        echo ""
-        echo -e "${YELLOW}Меню:${NC}"
-        echo ""
+        local c; c=$(get_rules_count); local t e; read -r t e <<< "$c"
+        echo -e "  Правил: ${CYAN}$t${NC} всего, ${GREEN}$e${NC} включено"
+        echo ""; echo -e "${YELLOW}Меню:${NC}"; echo ""
         echo "  1) 📋 Показать правила"
         echo "  2) ➕ Добавить правило"
         echo "  3) ⚡ Быстрое добавление"
@@ -609,25 +368,18 @@ main_menu() {
         echo "  7) 📊 Статус"
         echo "  0) 🚪 Выход"
         echo ""
-        read -p "Выбор: " choice
-
-        case $choice in
-            1) show_rules ;;
-            2) add_rule ;;
-            3) quick_add ;;
-            4) toggle_rule ;;
-            5) rename_rule ;;
-            6) delete_rule ;;
-            7) show_status ;;
-            0) print_success "До свидания!"; exit 0 ;;
-            *) print_error "Неверный выбор"; sleep 1 ;;
+        
+        local ch=""
+        read -rp "Выбор: " ch
+        case "$ch" in
+            1) show_rules;; 2) add_rule;; 3) quick_add;; 4) toggle_rule;;
+            5) rename_rule;; 6) delete_rule;; 7) show_status;;
+            0) print_success "До свидания!"; exit 0;;
+            *) print_error "Неверный выбор"; sleep 1;;
         esac
     done
 }
 
-#-------------------------------------------------------------------------------
-# Точка входа
-#-------------------------------------------------------------------------------
 check_root
 initial_setup
 apply_rules
