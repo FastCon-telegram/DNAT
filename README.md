@@ -1,21 +1,21 @@
-﻿# DNAT Manager
+# DNAT Manager
 
 Interactive script for managing DNAT rules in iptables.
 
 ## Installation
-`ash
+```bash
 wget -O /usr/local/bin/nat-manager https://raw.githubusercontent.com/FastCon-telegram/DNAT/main/nat-manager.sh
 chmod +x /usr/local/bin/nat-manager
-`
+```
 
 ## Usage
-`ash
+```bash
 sudo nat-manager
-`
+```
 
 ## Features
 
 - Add DNAT rules (TCP/UDP)
-- Delete rules
+- Delete rules  
 - Auto-save (persists after reboot)
 - Automatic IP Forwarding and MASQUERADE setup
