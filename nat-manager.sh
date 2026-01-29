@@ -1,15 +1,15 @@
 #!/bin/bash
 
 #===============================================================================
-# NAT Bridge Manager v3.0 - XDP Edition
-# - nftables поддержка (быстрее iptables)
-# - XDP ускорение (обработка пакетов в драйвере)
-# - Ring буферы + Interrupt Coalescing
+# NAT Bridge Manager v3.1 - VPS Edition
+# - nftables поддержка (быстрее iptables на 15-20%)
 # - Оптимизация Conntrack для 200K+ соединений
-# - Softirq budget для 10Gbit
+# - Softirq budget для высокой нагрузки
+# - Сетевые буферы 128MB
+# - Offload (GRO/GSO/TSO)
 #===============================================================================
 
-VERSION="3.0-XDP"
+VERSION="3.1-VPS"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -23,15 +23,14 @@ NC='\033[0m'
 RULES_DIR="/etc/nat-bridge"
 RULES_FILE="$RULES_DIR/rules.conf"
 CONFIG_FILE="$RULES_DIR/config.conf"
-XDP_DIR="/etc/nat-bridge/xdp"
 
 BACKEND="iptables"
 
 print_header() {
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}       ${GREEN}🚀 NAT Bridge Manager v${VERSION}${NC}                     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}       ${YELLOW}DNAT + XDP + nftables оптимизация${NC}                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}       ${GREEN}🚀 NAT Bridge Manager v${VERSION}${NC}                      ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}       ${YELLOW}DNAT + nftables + VPS оптимизация${NC}                   ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -69,7 +68,7 @@ EOF
 }
 
 initial_setup() {
-    mkdir -p "$RULES_DIR" "$XDP_DIR" 2>/dev/null || true
+    mkdir -p "$RULES_DIR" 2>/dev/null || true
     touch "$RULES_FILE" 2>/dev/null || true
     
     echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
@@ -92,6 +91,9 @@ initial_setup() {
     load_config
 }
 
+#===============================================================================
+# IPTABLES BACKEND
+#===============================================================================
 save_iptables() {
     mkdir -p /etc/iptables 2>/dev/null || true
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
@@ -127,6 +129,9 @@ remove_iptables_rule() {
     [[ "$pr" == "both" || "$pr" == "udp" ]] && iptables -t nat -D PREROUTING -p udp --dport "$sp" -j DNAT --to-destination "$di:$dp" 2>/dev/null || true
 }
 
+#===============================================================================
+# NFTABLES BACKEND
+#===============================================================================
 init_nftables() {
     nft flush ruleset 2>/dev/null || true
     nft add table ip nat 2>/dev/null || true
@@ -168,6 +173,9 @@ remove_nftables_rule() {
     fi
 }
 
+#===============================================================================
+# УНИВЕРСАЛЬНЫЕ ФУНКЦИИ
+#===============================================================================
 add_rule_backend() {
     local sp="$1" di="$2" dp="$3" pr="$4"
     
@@ -208,33 +216,9 @@ apply_rules() {
     done < "$RULES_FILE"
 }
 
-optimize_ring_buffers() {
-    local iface=$(get_main_interface)
-    [[ -z "$iface" ]] && return 1
-    
-    if command -v ethtool &>/dev/null; then
-        local max_rx=$(ethtool -g "$iface" 2>/dev/null | grep -A4 "Pre-set" | grep "RX:" | awk '{print $2}')
-        local max_tx=$(ethtool -g "$iface" 2>/dev/null | grep -A4 "Pre-set" | grep "TX:" | awk '{print $2}')
-        
-        [[ "$max_rx" != "n/a" && -n "$max_rx" ]] && ethtool -G "$iface" rx "$max_rx" 2>/dev/null || true
-        [[ "$max_tx" != "n/a" && -n "$max_tx" ]] && ethtool -G "$iface" tx "$max_tx" 2>/dev/null || true
-        return 0
-    fi
-    return 1
-}
-
-optimize_interrupt_coalescing() {
-    local iface=$(get_main_interface)
-    [[ -z "$iface" ]] && return 1
-    
-    if command -v ethtool &>/dev/null; then
-        ethtool -C "$iface" adaptive-rx on adaptive-tx on 2>/dev/null || \
-        ethtool -C "$iface" rx-usecs 50 rx-frames 64 tx-usecs 50 tx-frames 64 2>/dev/null || true
-        return 0
-    fi
-    return 1
-}
-
+#===============================================================================
+# ОПТИМИЗАЦИЯ: CONNTRACK
+#===============================================================================
 optimize_conntrack() {
     local current_max=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 0)
     local current_hashsize=$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo 0)
@@ -259,6 +243,9 @@ optimize_conntrack() {
     return 0
 }
 
+#===============================================================================
+# ОПТИМИЗАЦИЯ: SOFTIRQ BUDGET
+#===============================================================================
 optimize_softirq_budget() {
     local current_budget=$(sysctl -n net.core.netdev_budget 2>/dev/null || echo 0)
     local current_backlog=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo 0)
@@ -280,6 +267,9 @@ optimize_softirq_budget() {
     return 0
 }
 
+#===============================================================================
+# ОПТИМИЗАЦИЯ: СЕТЕВЫЕ БУФЕРЫ
+#===============================================================================
 optimize_network_buffers() {
     local current_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
     local current_wmem=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
@@ -298,199 +288,27 @@ optimize_network_buffers() {
     return 0
 }
 
-optimize_irq_affinity() {
-    local iface=$(get_main_interface)
-    [[ -z "$iface" ]] && return 1
-    
-    systemctl stop irqbalance 2>/dev/null || true
-    systemctl disable irqbalance 2>/dev/null || true
-    
-    local cpu_count=$(nproc)
-    local irq_list=$(grep "$iface" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ')
-    local cpu_idx=0
-    
-    for irq in $irq_list; do
-        if [[ -f "/proc/irq/$irq/smp_affinity" ]]; then
-            local mask=$((1 << cpu_idx))
-            printf "%x" $mask > "/proc/irq/$irq/smp_affinity" 2>/dev/null || true
-            cpu_idx=$(( (cpu_idx + 1) % cpu_count ))
-        fi
-    done
-    
-    return 0
-}
-
+#===============================================================================
+# ОПТИМИЗАЦИЯ: OFFLOAD
+#===============================================================================
 optimize_offload() {
     local iface=$(get_main_interface)
     [[ -z "$iface" ]] && return 1
     
     if command -v ethtool &>/dev/null; then
         ethtool -K "$iface" gro on gso on tso on 2>/dev/null || true
-        ethtool -K "$iface" rx-gro-hw on 2>/dev/null || true
     fi
     
     return 0
 }
 
-install_xdp_deps() {
-    print_info "Установка зависимостей XDP..."
-    
-    apt-get update -qq 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        clang llvm libbpf-dev linux-headers-$(uname -r) \
-        bpftool iproute2 > /dev/null 2>&1 || {
-        print_warning "Некоторые XDP зависимости не установились"
-        return 1
-    }
-    
-    print_success "XDP зависимости установлены"
-    return 0
-}
-
-create_xdp_program() {
-    local rules_count=0
-    local xdp_rules=""
-    
-    while IFS='|' read -r name sp di dp pr en; do
-        [[ -z "$name" || "$name" == \#* || -z "$sp" || "$en" != "1" ]] && continue
-        
-        local ip_hex=$(echo "$di" | awk -F. '{printf "0x%02x%02x%02x%02x", $4, $3, $2, $1}')
-        
-        if [[ "$pr" == "both" || "$pr" == "tcp" ]]; then
-            xdp_rules+="
-        if (tcp && tcp->dest == __constant_htons($sp)) {
-            ip->daddr = __constant_htonl($ip_hex);
-            tcp->dest = __constant_htons($dp);
-            goto recompute;
-        }"
-            rules_count=$((rules_count + 1))
-        fi
-        
-        if [[ "$pr" == "both" || "$pr" == "udp" ]]; then
-            xdp_rules+="
-        if (udp && udp->dest == __constant_htons($sp)) {
-            ip->daddr = __constant_htonl($ip_hex);
-            udp->dest = __constant_htons($dp);
-            goto recompute;
-        }"
-            rules_count=$((rules_count + 1))
-        fi
-    done < "$RULES_FILE"
-    
-    if [[ $rules_count -eq 0 ]]; then
-        print_warning "Нет активных правил для XDP"
-        return 1
-    fi
-    
-    cat > "$XDP_DIR/xdp_dnat.c" << 'XDPHEADER'
-#include <linux/bpf.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/tcp.h>
-#include <linux/udp.h>
-#include <linux/in.h>
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_endian.h>
-
-static __always_inline __u16 csum_fold_helper(__u32 csum) {
-    csum = (csum & 0xffff) + (csum >> 16);
-    csum = (csum & 0xffff) + (csum >> 16);
-    return (__u16)~csum;
-}
-
-static __always_inline void update_ip_checksum(struct iphdr *ip) {
-    __u32 csum = 0;
-    __u16 *ptr = (__u16 *)ip;
-    ip->check = 0;
-    #pragma unroll
-    for (int i = 0; i < 10; i++) { csum += ptr[i]; }
-    ip->check = csum_fold_helper(csum);
-}
-
-SEC("xdp")
-int xdp_dnat_prog(struct xdp_md *ctx) {
-    void *data = (void *)(long)ctx->data;
-    void *data_end = (void *)(long)ctx->data_end;
-    
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) return XDP_PASS;
-    if (eth->h_proto != __constant_htons(ETH_P_IP)) return XDP_PASS;
-    
-    struct iphdr *ip = (void *)(eth + 1);
-    if ((void *)(ip + 1) > data_end) return XDP_PASS;
-    
-    struct tcphdr *tcp = NULL;
-    struct udphdr *udp = NULL;
-    
-    if (ip->protocol == IPPROTO_TCP) {
-        tcp = (void *)ip + (ip->ihl * 4);
-        if ((void *)(tcp + 1) > data_end) return XDP_PASS;
-    } else if (ip->protocol == IPPROTO_UDP) {
-        udp = (void *)ip + (ip->ihl * 4);
-        if ((void *)(udp + 1) > data_end) return XDP_PASS;
-    } else { return XDP_PASS; }
-XDPHEADER
-    
-    echo "$xdp_rules" >> "$XDP_DIR/xdp_dnat.c"
-    
-    cat >> "$XDP_DIR/xdp_dnat.c" << 'XDPFOOTER'
-    return XDP_PASS;
-recompute:
-    update_ip_checksum(ip);
-    return XDP_TX;
-}
-char _license[] SEC("license") = "GPL";
-XDPFOOTER
-
-    print_success "XDP программа сгенерирована"
-    return 0
-}
-
-compile_and_load_xdp() {
-    local iface=$(get_main_interface)
-    [[ -z "$iface" ]] && { print_error "Интерфейс не найден"; return 1; }
-    
-    print_info "Компиляция XDP..."
-    cd "$XDP_DIR" || return 1
-    
-    clang -O2 -g -Wall -target bpf -I/usr/include/$(uname -m)-linux-gnu -c xdp_dnat.c -o xdp_dnat.o 2>&1 || {
-        print_error "Ошибка компиляции XDP"; return 1
-    }
-    
-    print_success "XDP скомпилирован"
-    ip link set dev "$iface" xdp off 2>/dev/null || true
-    
-    if ip link set dev "$iface" xdp obj xdp_dnat.o sec xdp 2>/dev/null; then
-        print_success "XDP загружен (native)"
-        BACKEND="xdp"; save_config; return 0
-    fi
-    
-    if ip link set dev "$iface" xdpgeneric obj xdp_dnat.o sec xdp 2>/dev/null; then
-        print_success "XDP загружен (generic)"
-        BACKEND="xdp"; save_config; return 0
-    fi
-    
-    print_error "Не удалось загрузить XDP"; return 1
-}
-
-unload_xdp() {
-    local iface=$(get_main_interface)
-    [[ -z "$iface" ]] && return 1
-    
-    ip link set dev "$iface" xdp off 2>/dev/null || true
-    
-    if [[ "$BACKEND" == "xdp" ]]; then
-        BACKEND="iptables"; save_config; apply_rules
-    fi
-    
-    print_success "XDP выгружен"
-    return 0
-}
-
+#===============================================================================
+# МЕНЮ: Оптимизация DNAT
+#===============================================================================
 optimization_menu() {
     while true; do
         print_header
-        echo -e "${MAGENTA}⚡ Оптимизация DNAT для 10Gbit${NC}"
+        echo -e "${MAGENTA}⚡ Оптимизация DNAT для VPS${NC}"
         echo "═══════════════════════════════════════════════════════════════════════"
         echo ""
         
@@ -498,24 +316,16 @@ optimization_menu() {
         echo -e "Интерфейс: ${CYAN}$iface${NC} | Backend: ${GREEN}$BACKEND${NC} | CPU: ${CYAN}$(nproc)${NC}"
         echo ""
         
-        echo -e "${YELLOW}Базовая оптимизация:${NC}"
-        echo "  1) 📦 Ring буферы"
-        echo "  2) ⏱️  Interrupt Coalescing"
-        echo "  3) 🔗 Conntrack (4M)"
-        echo "  4) 📊 Softirq budget (100K)"
-        echo "  5) 📡 Сетевые буферы (128MB)"
-        echo "  6) 🎯 IRQ Affinity"
-        echo "  7) 🚀 Offload (GRO/GSO/TSO)"
-        echo "  8) ⚡ Применить ВСЁ"
+        echo -e "${YELLOW}Оптимизация:${NC}"
+        echo "  1) 🔗 Conntrack (4M соединений)"
+        echo "  2) 📊 Softirq budget (100K пакетов/цикл)"
+        echo "  3) 📡 Сетевые буферы (128MB)"
+        echo "  4) 🚀 Offload (GRO/GSO/TSO)"
+        echo "  5) ⚡ Применить ВСЁ"
         echo ""
         echo -e "${YELLOW}Backend:${NC}"
-        echo "  9) 🔄 nftables"
-        echo " 10) 🔄 iptables"
-        echo ""
-        echo -e "${YELLOW}XDP:${NC}"
-        echo " 11) 📥 Установить XDP"
-        echo " 12) 🚀 Включить XDP"
-        echo " 13) ⏹️  Выключить XDP"
+        echo "  6) 🔄 Переключить на nftables (быстрее)"
+        echo "  7) 🔄 Переключить на iptables (стандарт)"
         echo ""
         echo "  0) ◀️  Назад"
         echo ""
@@ -523,45 +333,86 @@ optimization_menu() {
         read -rp "Выбор: " ch
         
         case "$ch" in
-            1) optimize_ring_buffers && print_success "Ring буферы OK" || print_warning "Не поддерживается"; sleep 2;;
-            2) optimize_interrupt_coalescing && print_success "Coalescing OK" || print_warning "Не поддерживается"; sleep 2;;
-            3) optimize_conntrack && print_success "Conntrack 4M OK"; sleep 2;;
-            4) optimize_softirq_budget && print_success "Softirq 100K OK"; sleep 2;;
-            5) optimize_network_buffers && print_success "Буферы 128MB OK"; sleep 2;;
-            6) optimize_irq_affinity && print_success "IRQ OK"; sleep 2;;
-            7) optimize_offload && print_success "Offload OK"; sleep 2;;
-            8)
-                optimize_ring_buffers; optimize_interrupt_coalescing
-                optimize_conntrack; optimize_softirq_budget
-                optimize_network_buffers; optimize_irq_affinity; optimize_offload
+            1) optimize_conntrack && print_success "Conntrack 4M OK"; sleep 2;;
+            2) optimize_softirq_budget && print_success "Softirq 100K OK"; sleep 2;;
+            3) optimize_network_buffers && print_success "Буферы 128MB OK"; sleep 2;;
+            4) optimize_offload && print_success "Offload OK"; sleep 2;;
+            5)
+                echo ""
+                optimize_conntrack && print_success "Conntrack 4M"
+                optimize_softirq_budget && print_success "Softirq 100K"
+                optimize_network_buffers && print_success "Буферы 128MB"
+                optimize_offload && print_success "Offload"
                 OPTIMIZATION_APPLIED=1; save_config
-                print_success "Вся оптимизация применена!"; sleep 3;;
-            9) iptables -t nat -F PREROUTING 2>/dev/null; init_nftables; BACKEND="nftables"; save_config; apply_rules; print_success "nftables"; sleep 2;;
-            10) nft flush ruleset 2>/dev/null; BACKEND="iptables"; save_config; apply_rules; print_success "iptables"; sleep 2;;
-            11) install_xdp_deps; sleep 2;;
-            12) create_xdp_program && compile_and_load_xdp; sleep 3;;
-            13) unload_xdp; sleep 2;;
+                echo ""
+                print_success "Вся оптимизация применена!"
+                sleep 3;;
+            6) 
+                iptables -t nat -F PREROUTING 2>/dev/null
+                init_nftables
+                BACKEND="nftables"; save_config; apply_rules
+                print_success "Backend: nftables"
+                sleep 2;;
+            7) 
+                nft flush ruleset 2>/dev/null
+                BACKEND="iptables"; save_config; apply_rules
+                ensure_masquerade_iptables; save_iptables
+                print_success "Backend: iptables"
+                sleep 2;;
             0) return;;
         esac
     done
 }
 
+#===============================================================================
+# МЕНЮ: Статус оптимизации
+#===============================================================================
 show_optimization_status() {
     print_header
     echo -e "${CYAN}📊 Статус оптимизации${NC}"
     echo "═══════════════════════════════════════════════════════════════════════"
     local iface=$(get_main_interface)
-    echo "Интерфейс: $iface | Backend: $BACKEND | CPU: $(nproc)"
     echo ""
-    echo "Conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)/$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null)"
-    echo "Hashsize: $(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null)"
-    echo "Budget: $(sysctl -n net.core.netdev_budget 2>/dev/null) | Backlog: $(sysctl -n net.core.netdev_max_backlog 2>/dev/null)"
-    echo "rmem_max: $(sysctl -n net.core.rmem_max 2>/dev/null) | wmem_max: $(sysctl -n net.core.wmem_max 2>/dev/null)"
+    echo -e "Интерфейс: ${CYAN}$iface${NC}"
+    echo -e "Backend: ${GREEN}$BACKEND${NC}"
+    echo -e "CPU: ${CYAN}$(nproc)${NC} ядер"
     echo ""
-    [[ -n "$iface" ]] && echo "XDP: $(ip link show "$iface" 2>/dev/null | grep -o "xdp[^ ]*" || echo "не загружен")"
-    echo ""; read -rp "Enter..."
+    
+    echo -e "${YELLOW}Conntrack:${NC}"
+    local ct_max=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null)
+    local ct_cur=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+    local ct_hash=$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null)
+    echo "  Max: $ct_max (цель: 4194304) $([[ $ct_max -ge 4194304 ]] && echo '✓' || echo '⚠')"
+    echo "  Current: $ct_cur"
+    echo "  Hashsize: $ct_hash (цель: 1048576) $([[ $ct_hash -ge 1048576 ]] && echo '✓' || echo '⚠')"
+    echo ""
+    
+    echo -e "${YELLOW}Softirq:${NC}"
+    local budget=$(sysctl -n net.core.netdev_budget 2>/dev/null)
+    local backlog=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null)
+    echo "  Budget: $budget (цель: 100000) $([[ $budget -ge 100000 ]] && echo '✓' || echo '⚠')"
+    echo "  Backlog: $backlog (цель: 250000) $([[ $backlog -ge 250000 ]] && echo '✓' || echo '⚠')"
+    echo ""
+    
+    echo -e "${YELLOW}Буферы:${NC}"
+    local rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
+    local wmem=$(sysctl -n net.core.wmem_max 2>/dev/null)
+    echo "  rmem_max: $rmem (цель: 134217728) $([[ $rmem -ge 134217728 ]] && echo '✓' || echo '⚠')"
+    echo "  wmem_max: $wmem (цель: 134217728) $([[ $wmem -ge 134217728 ]] && echo '✓' || echo '⚠')"
+    echo ""
+    
+    echo -e "${YELLOW}Offload:${NC}"
+    if command -v ethtool &>/dev/null && [[ -n "$iface" ]]; then
+        ethtool -k "$iface" 2>/dev/null | grep -E "generic-receive|generic-segmentation|tcp-segmentation" | sed 's/^/  /'
+    fi
+    
+    echo ""
+    read -rp "Нажмите Enter..."
 }
 
+#===============================================================================
+# СТАНДАРТНЫЕ ФУНКЦИИ
+#===============================================================================
 get_rules_count() {
     local t=0 e=0
     [[ -f "$RULES_FILE" ]] && while IFS='|' read -r n sp di dp pr en; do
@@ -613,7 +464,6 @@ add_rule() {
     
     echo "${rn}|${sp}|${di}|${dp}|${pr}|1" >> "$RULES_FILE"
     add_rule_backend "$sp" "$di" "$dp" "$pr"
-    [[ "$BACKEND" == "xdp" ]] && create_xdp_program && compile_and_load_xdp
     
     print_success "Добавлено"; sleep 2
 }
@@ -629,7 +479,6 @@ quick_add() {
     
     echo "${rn}|${sp}|${di}|${dp}|both|1" >> "$RULES_FILE"
     add_rule_backend "$sp" "$di" "$dp" "both"
-    [[ "$BACKEND" == "xdp" ]] && create_xdp_program && compile_and_load_xdp
     
     print_success "$rn: :$sp → $di:$dp"; sleep 2
 }
@@ -668,7 +517,6 @@ toggle_rule() {
     done < "$RULES_FILE"
     mv "$tf" "$RULES_FILE"
     
-    [[ "$BACKEND" == "xdp" ]] && create_xdp_program && compile_and_load_xdp
     print_success "Переключено"; sleep 2
 }
 
@@ -696,7 +544,6 @@ delete_rule() {
     
     [[ "$ten" == "1" ]] && remove_rule_backend "$tsp" "$tdi" "$tdp" "$tpr"
     grep -v "^${tn}|" "$RULES_FILE" > "$RULES_FILE.tmp" && mv "$RULES_FILE.tmp" "$RULES_FILE"
-    [[ "$BACKEND" == "xdp" ]] && create_xdp_program && compile_and_load_xdp
     
     print_success "Удалено"; sleep 2
 }
@@ -723,6 +570,9 @@ cleanup_duplicates() {
     apply_rules
 }
 
+#===============================================================================
+# ГЛАВНОЕ МЕНЮ
+#===============================================================================
 main_menu() {
     while true; do
         print_header
